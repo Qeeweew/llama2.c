@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdint.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -148,6 +149,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
+    printf("Config: dim = %d, hidden_dim = %d, n_layers = %d, n_heads = %d, n_kv_heads = %d, vocab_size = %d, seq_len = %d\n",
+            config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->vocab_size, config->seq_len
+    );
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -214,17 +218,39 @@ void softmax(float* x, int size) {
     }
 }
 
+#include<immintrin.h>
+typedef union v8f_t
+{
+    float f[8];
+    __m256 v;
+}v8f_t;
+
+float vecdot(float* x, float* y, int n) {
+    v8f_t sum;
+    sum.v = _mm256_setzero_ps();
+    v8f_t a;
+    v8f_t b;
+    #pragma GCC unroll 4
+    for (int i = 0;i < n / 8;i++) {
+        a.v = _mm256_loadu_ps(x);
+        b.v = _mm256_loadu_ps(y);
+        sum.v = _mm256_fmadd_ps(a.v, b.v, sum.v);
+        x += 8;
+        y += 8;
+    }
+    float ans = sum.f[0] + sum.f[1] + sum.f[2] + sum.f[3] + sum.f[4] + sum.f[5] + sum.f[6] + sum.f[7];
+    for (int i = 0;i < (n & 7);i++) {
+        ans += x[i] * y[i];
+    }
+    return ans;
+}
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
+        xout[i] = vecdot(&w[i * n], x, n);
     }
 }
 
@@ -719,7 +745,7 @@ int sample(Sampler* sampler, float* logits) {
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
     struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
+    clock_gettime(0, &time);
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
