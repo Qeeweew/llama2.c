@@ -8,6 +8,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <assert.h>
+#include<immintrin.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -218,39 +220,55 @@ void softmax(float* x, int size) {
     }
 }
 
-#include<immintrin.h>
-typedef union v8f_t
+inline __m256 hsum8(__m256 a, __m256 b, __m256 c, __m256 d,
+             __m256 e, __m256 f, __m256 g, __m256 h)
 {
-    float f[8];
-    __m256 v;
-}v8f_t;
+    // a = [ A7 A6 A5 A4 | A3 A2 A1 A0 ]
+    __m256 sumab = _mm256_hadd_ps(a, b);
+    __m256 sumcd = _mm256_hadd_ps(c, d);
 
-float vecdot(float* x, float* y, int n) {
-    v8f_t sum;
-    sum.v = _mm256_setzero_ps();
-    v8f_t a;
-    v8f_t b;
-    #pragma GCC unroll 4
+    __m256 sumef = _mm256_hadd_ps(e, f);
+    __m256 sumgh = _mm256_hadd_ps(g, h);
+
+    __m256 sumabcd = _mm256_hadd_ps(sumab, sumcd);  // [ D7:4 ... A7:4 | D3:0 ... A3:0 ]
+    __m256 sumefgh = _mm256_hadd_ps(sumef, sumgh);  // [ H7:4 ... E7:4 | H3:0 ... E3:0 ]
+
+    __m256 sum_hi = _mm256_permute2f128_ps(sumabcd, sumefgh, 0x31);  // [ H7:4 ... E7:4 | D7:4 ... A7:4 ]
+    __m256 sum_lo = _mm256_permute2f128_ps(sumabcd, sumefgh, 0x20);  // [ H3:0 ... E3:0 | D3:0 ... A3:0 ]
+
+    __m256 result = _mm256_add_ps(sum_hi, sum_lo);
+    return result;
+}
+
+// 8 rows
+inline void vecdot(float* out, const float* x,const float* y, int n) {
+    __m256 sum[8];
+    for (int j = 0;j < 8;j++) {
+        sum[j] = _mm256_setzero_ps();
+    }
+    __m256 a[8];
+    __m256 b;
     for (int i = 0;i < n / 8;i++) {
-        a.v = _mm256_loadu_ps(x);
-        b.v = _mm256_loadu_ps(y);
-        sum.v = _mm256_fmadd_ps(a.v, b.v, sum.v);
+        b = _mm256_loadu_ps(y);
+#pragma unroll
+        for (int j = 0;j < 8;j++) {
+            a[j] = _mm256_loadu_ps(x + j * n);
+            sum[j] = _mm256_fmadd_ps(a[j], b, sum[j]);
+        }
         x += 8;
         y += 8;
     }
-    float ans = sum.f[0] + sum.f[1] + sum.f[2] + sum.f[3] + sum.f[4] + sum.f[5] + sum.f[6] + sum.f[7];
-    for (int i = 0;i < (n & 7);i++) {
-        ans += x[i] * y[i];
-    }
-    return ans;
+    __m256 ans = hsum8(sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
+    _mm256_storeu_ps(out, ans);
 }
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
+    assert(n % 8 == 0 && d % 8 == 0);
     int i;
     #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        xout[i] = vecdot(&w[i * n], x, n);
+    for (i = 0; i < d; i+=8) {
+        vecdot(&xout[i], &w[i * n], x, n);
     }
 }
 
