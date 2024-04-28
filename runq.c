@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <immintrin.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -314,30 +315,82 @@ void softmax(float* x, int size) {
     }
 }
 
+inline __m256i hsum8(__m256i a, __m256i b, __m256i c, __m256i d,
+                     __m256i e, __m256i f, __m256i g, __m256i h)
+{
+    // Perform pairwise horizontal addition
+    __m256i sumab = _mm256_hadd_epi32(a, b);
+    __m256i sumcd = _mm256_hadd_epi32(c, d);
+    __m256i sumef = _mm256_hadd_epi32(e, f);
+    __m256i sumgh = _mm256_hadd_epi32(g, h);
+
+    // Perform reduction across vectors
+    __m256i sumabcd = _mm256_hadd_epi32(sumab, sumcd);  // [ D3:0 ... A3:0 | D7:4 ... A7:4 ]
+    __m256i sumefgh = _mm256_hadd_epi32(sumef, sumgh);  // [ H3:0 ... E3:0 | H7:4 ... E7:4 ]
+
+    // Permute and add to get the final sum
+    __m256i sum_hi = _mm256_permute2x128_si256(sumabcd, sumefgh, 0x31);  // [ H7:4 ... E7:4 | D7:4 ... A7:4 ]
+    __m256i sum_lo = _mm256_permute2x128_si256(sumabcd, sumefgh, 0x20);  // [ H3:0 ... E3:0 | D3:0 ... A3:0 ]
+
+    // Final horizontal add to accumulate results into one vector
+    __m256i result = _mm256_add_epi32(sum_hi, sum_lo);
+    return result;
+}
+
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
 
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-
-        float val = 0.0f;
-        int32_t ival = 0;
-        int in = i * n;
-
+    int i0;
+    #pragma omp parallel for private(i0)
+    for (i0 = 0; i0 < d; i0+=8) {
+        __m256 val = _mm256_setzero_ps();
+        __m256i v_sum[8];
         // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+        for (int j = 0; j <= n - GS; j += GS) {
+            __m256i x0 = _mm256_loadu_si256((const __m256i*) &x->q[j +  0]);
+            __m256i x1 = _mm256_loadu_si256((const __m256i*) &x->q[j + 32]);
+            __m256i x00 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x0, 0));
+            __m256i x01 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x0, 1));
+            __m256i x10 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x1, 0));
+            __m256i x11 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x1, 1));
+            for (int i1 = 0;i1 < 8;i1++) {
+                int in = (i0 + i1) * n;
+                __m256i w0 = _mm256_loadu_si256((const __m256i*) &w->q[in + j +  0]);
+                __m256i w1 = _mm256_loadu_si256((const __m256i*) &w->q[in + j + 32]);
+                __m256i w00 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w0, 0));
+                __m256i w01 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w0, 1));
+                __m256i w10 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w1, 0));
+                __m256i w11 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w1, 1));
+                v_sum[i1] = _mm256_add_epi32(
+                    _mm256_add_epi32(
+                        _mm256_madd_epi16(x00, w00),
+                        _mm256_madd_epi16(x01, w01)),
+                    _mm256_add_epi32(
+                        _mm256_madd_epi16(x10, w10),
+                        _mm256_madd_epi16(x11, w11)));
             }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
+            __m256i ival8 = hsum8(
+                v_sum[0], v_sum[1], v_sum[2], v_sum[3],
+                v_sum[4], v_sum[5], v_sum[6], v_sum[7]
+            );
+            float* ws_base = &w->s[(i0 * n + j) / GS];
+            __m256 ws = _mm256_set_ps(
+                ws_base[7 * n / GS],
+                ws_base[6 * n / GS],
+                ws_base[5 * n / GS],
+                ws_base[4 * n / GS],
+                ws_base[3 * n / GS],
+                ws_base[2 * n / GS],
+                ws_base[1 * n / GS],
+                ws_base[0 * n / GS]
+            );
+            __m256 fval8 = _mm256_cvtepi32_ps(ival8);
+            __m256 xs = _mm256_broadcast_ss(&x->s[j / GS]);
+            val = _mm256_fmadd_ps(_mm256_mul_ps(fval8, xs), ws, val);
         }
-
-        xout[i] = val;
+        _mm256_storeu_ps(xout + i0, val);
     }
 }
 
