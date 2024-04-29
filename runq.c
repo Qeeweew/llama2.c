@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <immintrin.h>
 #if defined _WIN32
     #include "win.h"
@@ -315,6 +316,7 @@ void softmax(float* x, int size) {
     }
 }
 
+#ifdef __AVX2__
 inline __m256i hsum8(__m256i a, __m256i b, __m256i c, __m256i d,
                      __m256i e, __m256i f, __m256i g, __m256i h)
 {
@@ -336,15 +338,18 @@ inline __m256i hsum8(__m256i a, __m256i b, __m256i c, __m256i d,
     __m256i result = _mm256_add_epi32(sum_hi, sum_lo);
     return result;
 }
+#endif
 
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
-
+    int row_start = 0;
+    if (n % 8 != 0) goto NAIVE;
+#ifdef __AVX2__
     int i0;
     #pragma omp parallel for private(i0)
-    for (i0 = 0; i0 < d; i0+=8) {
+    for (i0 = 0; i0 <= d - 8; i0+=8) {
         __m256 val = _mm256_setzero_ps();
         __m256i v_sum[8];
         // do the matmul in groups of GS
@@ -391,6 +396,29 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
             val = _mm256_fmadd_ps(_mm256_mul_ps(fval8, xs), ws, val);
         }
         _mm256_storeu_ps(xout + i0, val);
+    }
+    if (d % 8 == 0) return;
+    row_start = d - d % 8;
+#endif
+NAIVE:
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = row_start; i < d; i++) {
+
+        float val = 0.0f;
+        int32_t ival = 0;
+        int in = i * n;
+
+        // do the matmul in groups of GS
+        int j;
+        for (j = 0; j <= n - GS; j += GS) {
+            for (int k = 0; k < GS; k++) {
+                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+            }
+            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+            ival = 0;
+        }
+        xout[i] = val;
     }
 }
 

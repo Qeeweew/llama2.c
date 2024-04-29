@@ -151,9 +151,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
-    printf("Config: dim = %d, hidden_dim = %d, n_layers = %d, n_heads = %d, n_kv_heads = %d, vocab_size = %d, seq_len = %d\n",
-            config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->vocab_size, config->seq_len
-    );
+    // printf("Config: dim = %d, hidden_dim = %d, n_layers = %d, n_heads = %d, n_kv_heads = %d, vocab_size = %d, seq_len = %d\n",
+    //         config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->vocab_size, config->seq_len
+    // );
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -220,6 +220,7 @@ void softmax(float* x, int size) {
     }
 }
 
+#ifdef __AVX2__
 inline __m256 hsum8(__m256 a, __m256 b, __m256 c, __m256 d,
              __m256 e, __m256 f, __m256 g, __m256 h)
 {
@@ -239,36 +240,45 @@ inline __m256 hsum8(__m256 a, __m256 b, __m256 c, __m256 d,
     __m256 result = _mm256_add_ps(sum_hi, sum_lo);
     return result;
 }
+#endif
 
-// 8 rows
-inline void vecdot(float* out, const float* x,const float* y, int n) {
-    __m256 sum[8];
-    for (int j = 0;j < 8;j++) {
-        sum[j] = _mm256_setzero_ps();
-    }
-    __m256 a[8];
-    __m256 b;
-    for (int i = 0;i < n / 8;i++) {
-        b = _mm256_loadu_ps(y);
-#pragma unroll
-        for (int j = 0;j < 8;j++) {
-            a[j] = _mm256_loadu_ps(x + j * n);
-            sum[j] = _mm256_fmadd_ps(a[j], b, sum[j]);
-        }
-        x += 8;
-        y += 8;
-    }
-    __m256 ans = hsum8(sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
-    _mm256_storeu_ps(out, ans);
-}
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    assert(n % 8 == 0 && d % 8 == 0);
-    int i;
+    int row_start = 0;
+    if (n % 8 != 0) goto NAIVE;
+#ifdef __AVX2__
+    int i0;
+    #pragma omp parallel for private(i0)
+    for (i0 = 0; i0 <= d - 8; i0+=8) {
+        __m256 sum[8];
+        for (int j = 0; j < 8; j++)  {
+            sum[j] = _mm256_setzero_ps();
+        }
+        __m256 a[8];
+        __m256 b;
+        for  (int k = 0; k < n; k+=8)  {
+            b = _mm256_loadu_ps(&x[k]);
+            for (int i1 = 0; i1 < 8; i1++)  {
+                a[i1] = _mm256_loadu_ps(&w[(i0 + i1) * n + k]);
+                sum[i1] = _mm256_fmadd_ps(a[i1], b, sum[i1]);
+            }
+        }
+        __m256 ans = hsum8(sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
+        _mm256_storeu_ps(&xout[i0], ans);
+    }
+    if (d % 8 == 0) return;
+    row_start = d - d % 8;
+#endif
+NAIVE:
+    int i = row_start;
     #pragma omp parallel for private(i)
-    for (i = 0; i < d; i+=8) {
-        vecdot(&xout[i], &w[i * n], x, n);
+    for (i = row_start; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
     }
 }
 
