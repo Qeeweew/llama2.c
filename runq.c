@@ -147,7 +147,40 @@ void dequantize(QuantizedTensor *qx, float* x, int n) {
 void quantize(QuantizedTensor *qx, float* x, int n) {
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
+#ifdef __AVX2__
+    for (int group = 0; group < num_groups; group++) {
+        __m256 ymm_wmax, ymm_iscale;
+        __m256 ymm_x[8];
+        // find the max absolute value in the current group
+        ymm_wmax = _mm256_setzero_ps();
+        for (int i = 0; i < GS; i += 8) {
+            ymm_x[i / 8] = _mm256_loadu_ps(&x[group * GS + i]);
+            __m256 ymm_x_abs = _mm256_and_ps(ymm_x[i / 8], _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF))); // abs
+            ymm_wmax = _mm256_max_ps(ymm_wmax, ymm_x_abs);
+        }
 
+        ymm_wmax = _mm256_max_ps(ymm_wmax, _mm256_permute2f128_ps(ymm_wmax, ymm_wmax, 0x1)); // 8 -> 4
+        ymm_wmax = _mm256_max_ps(ymm_wmax, _mm256_permute_ps(ymm_wmax, _MM_SHUFFLE(2, 3, 0, 1))); // 4 -> 2
+        ymm_wmax = _mm256_max_ps(ymm_wmax, _mm256_permute_ps(ymm_wmax, _MM_SHUFFLE(1, 0, 3, 2))); // 2 -> 1
+        float wmax = _mm256_cvtss_f32(ymm_wmax);
+        // calculate and write the scaling factor
+        float scale = wmax / Q_MAX;
+        qx->s[group] = scale;
+        float iscale = scale == 0 ? 0.0f : 1.0f / scale;
+        ymm_iscale = _mm256_broadcast_ss(&iscale);
+        // calculate and write the quantized values
+        for (int i = 0; i < GS; i += 32) {
+            __m256i ymm_quant0 = _mm256_cvtps_epi32(_mm256_mul_ps(ymm_x[i / 8 + 0], ymm_iscale));
+            __m256i ymm_quant1 = _mm256_cvtps_epi32(_mm256_mul_ps(ymm_x[i / 8 + 1], ymm_iscale));
+            __m256i ymm_quant2 = _mm256_cvtps_epi32(_mm256_mul_ps(ymm_x[i / 8 + 2], ymm_iscale));
+            __m256i ymm_quant3 = _mm256_cvtps_epi32(_mm256_mul_ps(ymm_x[i / 8 + 3], ymm_iscale));
+            __m256i ymm_quant01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(ymm_quant0, ymm_quant1), 0b11011000);
+            __m256i ymm_quant23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(ymm_quant2, ymm_quant3), 0b11011000);
+            __m256i ymm_quantized =_mm256_permute4x64_epi64(_mm256_packs_epi16(ymm_quant01, ymm_quant23), 0b11011000); 
+            _mm256_storeu_si256((__m256i*)&qx->q[group * GS + i], ymm_quantized);
+        }
+    }
+#else
     for (int group = 0; group < num_groups; group++) {
 
         // find the max absolute value in the current group
@@ -170,6 +203,7 @@ void quantize(QuantizedTensor *qx, float* x, int n) {
             qx->q[group * GS + i] = quantized;
         }
     }
+#endif
 }
 
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
